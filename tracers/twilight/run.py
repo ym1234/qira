@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
+
+# Current bug: https://github.com/qilingframework/qiling/issues/1201
+# Previous bug: https://github.com/unicorn-engine/unicorn/pull/901
+# https://scoding.de/setting-global-descriptor-table-unicorn
+
 from __future__ import print_function
 import os
+import faulthandler
 import sys
 import mmap
 import struct
@@ -8,6 +14,7 @@ import ctypes
 from hexdump import hexdump
 from helpers import *
 
+faulthandler.enable()
 # start the <<<shell process>>>
 child = os.fork()
 if child == 0:
@@ -74,9 +81,9 @@ def shell_map_file(addr, name, size, prot, offset=0):
 segs = [[int("0x"+y, 16) for y in x.split(" ")[0].split("-")] \
         for x in open("/proc/%d/maps" % child).read().strip().split("\n")]
 stub_segs = filter(lambda x: (x[0] <= stub_location and stub_location < x[1]), segs)
-ok_segs = filter(lambda x: not 
-  ((x[0] <= stub_location and stub_location < x[1]) or 
-    x[0] == 0xffffffffff600000), segs) 
+ok_segs = filter(lambda x: not
+  ((x[0] <= stub_location and stub_location < x[1]) or
+    x[0] == 0xffffffffff600000), segs)
 [shell_unmap(*x) for x in ok_segs]
 
 # loading time
@@ -133,16 +140,17 @@ def wrapped_mem_map(address, size, fd=None, prot=mmap.PROT_READ | mmap.PROT_WRIT
 
 # load the stack into unicorn
 # https://www.win.tue.nl/~aeb/linux/hh/stack-layout.html
+linker = b'/usr/lib64/ld-linux-x86-64.so.2' # b'/lib/x86_64-linux-gnu/ld-2.23.so'
 STACK_TOP = 0xaaa0000
-STACK_SIZE = 0x8000
+STACK_SIZE = 0x200000
 wrapped_mem_map(STACK_TOP-STACK_SIZE, STACK_SIZE)  # fake stack
 argv = sys.argv[1].encode('utf-8')
-stack = b"/lib/x86_64-linux-gnu/ld-2.23.so\x00"+argv+b"\x00"
+stack = linker+b"\x00"+argv+b"\x00"
 stack = struct.pack("QQQQQQ",
    # argc
    2,
    # argv
-   STACK_TOP-len(stack)+stack.index(b"/lib/x86_64-linux-gnu/ld-2.23.so"),
+   STACK_TOP-len(stack)+stack.index(linker),
    STACK_TOP-len(stack)+stack.index(argv),
    0,
    # envp
@@ -155,7 +163,7 @@ mu.mem_write(STACK_TOP-len(stack), stack)
 mu.reg_write(UC_X86_REG_RSP, STACK_TOP-len(stack))
 
 # load the dynamic loader, so meta
-ld = cle.Loader("/lib/x86_64-linux-gnu/ld-2.23.so")
+ld = cle.Loader(linker.decode("utf8"))
 obj = ld.main_object
 print("entry point: %x" % obj.entry)
 
@@ -175,8 +183,46 @@ for seg in obj.segments:
   mu.mem_write(OFFSET + seg.vaddr, ld.memory.load(seg.vaddr, seg.memsize))
 print("loaded file")
 
+
+SCRATCH_ADDR = 0x40000
+SCRATCH_SIZE = 0x1000
+
+mu.mem_map(SCRATCH_ADDR, SCRATCH_SIZE)
+
+FSMSR = 0xC0000100
+GSMSR = 0xC0000101
+
+EXEC = False
+exec_args = []
 # hook interrupts for syscall
-import angr.procedures.definitions.linux_kernel as lk 
+import angr.procedures.definitions.linux_kernel as lk
+def set_msr(mu, msr, value, scratch=SCRATCH_ADDR):
+    '''
+    set the given model-specific register (MSR) to the given value.
+    this will clobber some memory at the given scratch address, as it emits some code.
+    '''
+    # save clobbered registers
+    orax = mu.reg_read(UC_X86_REG_RAX)
+    ordx = mu.reg_read(UC_X86_REG_RDX)
+    orcx = mu.reg_read(UC_X86_REG_RCX)
+    orip = mu.reg_read(UC_X86_REG_RIP)
+
+    # x86: wrmsr
+    buf = b'\x0f\x30'
+    mu.mem_write(scratch, buf)
+    mu.reg_write(UC_X86_REG_RAX, value & 0xFFFFFFFF)
+    mu.reg_write(UC_X86_REG_RDX, (value >> 32) & 0xFFFFFFFF)
+    mu.reg_write(UC_X86_REG_RCX, msr & 0xFFFFFFFF)
+    mu.emu_start(scratch, scratch+len(buf), count=1)
+
+    # restore clobbered registers
+    mu.reg_write(UC_X86_REG_RAX, orax)
+    mu.reg_write(UC_X86_REG_RDX, ordx)
+    mu.reg_write(UC_X86_REG_RCX, orcx)
+    mu.reg_write(UC_X86_REG_RIP, orip)
+
+ARCH_SET_GS	= 0x1001
+ARCH_SET_FS	= 0x1002
 def hook_syscall(mu, user_data):
   num = mu.reg_read(UC_X86_REG_RAX)
   rargs = [UC_X86_REG_RDI, UC_X86_REG_RSI, UC_X86_REG_RDX,
@@ -184,14 +230,16 @@ def hook_syscall(mu, user_data):
   args = [mu.reg_read(x) for x in rargs]
   rip = mu.reg_read(UC_X86_REG_RIP)
 
-  print("%8x syscall %4d : %-20s %x %x %x" %
-    (rip, num, lk.lib.syscall_number_mapping['amd64'][num], args[0], args[1], args[2]), end=" ")
+  try:
+      print("%8x syscall %4d : %-20s %x %x %x\n" % (rip, num, lk.lib.syscall_number_mapping['amd64'][num], args[0], args[1], args[2]), end=" ")
+  except:
+      print("%8x syscall %4d : %-20s %x %x %x\n" % (rip, num, "NAME NOT KNOWN", args[0], args[1], args[2]), end=" ")
 
   if num == 231 or num == 60:
     print("fake exit(%d)" % args[0])
     return
 
-  # do syscall in shell process 
+  # do syscall in shell process
   ret = shell_syscall(num, args, rip)
   mu.reg_write(UC_X86_REG_RAX, ret)
 
@@ -221,6 +269,16 @@ def hook_syscall(mu, user_data):
     if dat is not None:
       print("%x %x" % (ret, len(dat)))
       mu.mem_write(ret, dat)
+  elif num == 158 and (args[0] == ARCH_SET_GS or args[0] == ARCH_SET_FS):
+      global EXEC
+      global exec_args
+      EXEC = True
+      exec_args = args
+      mu.emu_stop()
+  elif num == 39:
+      pid = os.getpid()
+      mu.reg_write(UC_X86_REG_RAX, -1)
+      # mu.reg_write(UC_X86_REG_RAX, pid)
 
   print("    returned %x" % ret)
 
@@ -232,12 +290,37 @@ mu.hook_add(UC_HOOK_INSN, hook_syscall, None, 1, 0, UC_X86_INS_SYSCALL)
 print("shell process")
 pmaps()
 
+rbx = 0
 # for debugging
+def hook_code2(uc, address, size, user_data):
+    if address == 0x400000c950:
+        uc.reg_write(UC_X86_REG_RIP, 0x400000cfad)
+    if address == 0x400000d396:
+        uc.reg_write(UC_X86_REG_AL, 1)
+    if address == 0x400000c890:
+        uc.emu_stop()
+    # elif address == 0x400000c8e0:
+    #     uc.reg_write(UC_X86_REG_R13D, 1)
+    # elif address == 0x400000cdd0:
+    #     uc.reg_write(UC_X86_REG_RIP, 0x400000cfeb)
+    # elif address == 0x4000021c1b:
+    #     uc.reg_write(UC_X86_REG_RAX, 0)
+    # elif address == 0x4000019db7:
+    #     uc.reg_write(UC_X86_REG_RIP, 0x4000019dc7)
+    # elif address == 0x400000c958:
+    #     uc.reg_write(UC_X86_REG_AL, 0xa)
+    # elif address == 0x400000d396:
+    #     uc.reg_write(UC_X86_REG_AL, 1)
+    # elif address == 0x400000c8e6:
+    #     uc.reg_write(UC_X86_REG_R14D, 1)
+
 def hook_code(uc, address, size, user_data):
   #print(">>> Tracing instruction at 0x%x, instruction size = 0x%x" %(address, size))
   for i in md.disasm(mu.mem_read(address, size), address):
     print("  0x%x:\t%s\t%s" %(i.address, i.mnemonic, i.op_str))
-#mu.hook_add(UC_HOOK_CODE, hook_code)
+
+mu.hook_add(UC_HOOK_CODE, hook_code)
+mu.hook_add(UC_HOOK_CODE, hook_code2)
 
 # QIRA tracer
 qlog_base = open("/tmp/qira_logs/1_base", "w")
@@ -263,14 +346,43 @@ def hook_code_qlog(uc, address, size, user_data):
   for i in range(0, len(regs)):
     dat = struct.pack("QQII", i*8, aa[i], clnum, IS_VALID | IS_WRITE)
     qlog.write(dat)
-#mu.hook_add(UC_HOOK_CODE, hook_code_qlog)
+mu.hook_add(UC_HOOK_CODE, hook_code_qlog)
 
 # run
 print("emulation started")
-try:
-  mu.emu_start(OFFSET + obj.entry, 0)
-except unicorn.UcError:
-  print("issue")
+rip = OFFSET + obj.entry
+x = False
+while True:
+    try:
+        mu.emu_start(rip, 0)
+        if EXEC:
+            EXEC = False
+            if exec_args[0] == ARCH_SET_GS:
+                set_msr(mu, GSMSR, exec_args[1])
+            elif exec_args[0] == ARCH_SET_FS:
+                set_msr(mu, FSMSR, exec_args[1])
+            rip = mu.reg_read(UC_X86_REG_RIP)
+        else:
+            break
+    except unicorn.UcError as e:
+        print(f"issue: {e}")
+        # # rip = mu.reg_read(UC_X86_REG_RIP)
+        # rip = 0x400001e7f1
+        # # mu.reg_write(UC_X86_REG_RAX, 0x104e7e867c78948)
+# 0x400001e7f1 + 8
+        # mu.reg_write(UC_X86_REG_RDX, )
+        # rip = mu.reg_read(UC_X86_REG_RIP)
+        # rip -
+
+        # HACK I'm not sure what's wrong, but shifting the address by 8 seems to fix it
+        z = mu.mem_read(0x400001e7f1 + 0x14248, 8)
+        import struct
+        z = struct.unpack("<Q", z)[0] << 8
+        mu.reg_write(UC_X86_REG_RDX, z)
+        rip = mu.reg_read(UC_X86_REG_RIP)
+        if x:
+            break
+        x = True
 
 pmaps()
 print("exiting")
